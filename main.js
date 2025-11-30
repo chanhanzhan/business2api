@@ -3,6 +3,42 @@ const axios = require('axios');
 const fs = require('fs').promises;
 const path = require('path');
 
+// 检测是否是页面导航相关的错误
+function isNavigationError(err) {
+    if (!err || !err.message) return false;
+    const msg = err.message.toLowerCase();
+    return msg.includes('execution context was destroyed') ||
+           msg.includes('navigation') ||
+           msg.includes('detached') ||
+           msg.includes('does not belong to the document') ||
+           msg.includes('target closed') ||
+           msg.includes('session closed');
+}
+
+// 安全地等待并输入文本（带重试）
+async function safeTypeInput(page, selector, text, options = {}, maxRetries = 3) {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            // 先确保元素存在
+            await page.waitForSelector(selector, { timeout: 10000 });
+            await page.type(selector, text, options);
+            return true;
+        } catch (err) {
+            if (isNavigationError(err)) {
+                return false; // 导航错误，认为可能成功
+            }
+            if (err.message.includes('No element found')) {
+                // 元素未找到，等待后重试
+                await new Promise(r => setTimeout(r, 2000));
+                continue;
+            }
+            if (i === maxRetries - 1) throw err;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+    }
+    return false;
+}
+
 // 解析命令行参数
 function parseArgs() {
     const args = process.argv.slice(2);
@@ -329,23 +365,41 @@ async function runTask(threadId, config) {
             timeout: 60000
         });
         // 等待输入框出现
-        await page.waitForSelector('input', { timeout: 30000 });
+        try {
+            await page.waitForSelector('input', { timeout: 30000 });
+        } catch (waitErr) {
+            if (isNavigationError(waitErr)) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 等待邮箱输入框时页面导航，重试...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                await page.waitForSelector('input', { timeout: 30000 }).catch(() => {});
+            } else {
+                throw waitErr;
+            }
+        }
         await new Promise(resolve => setTimeout(resolve, 2000));
 
         // 先点击输入框聚焦
-        await page.evaluate(() => {
-            const inputs = document.querySelectorAll('input');
-            if (inputs.length > 0) {
-                inputs[0].click();
-                inputs[0].focus();
-            }
-        });
+        try {
+            await page.evaluate(() => {
+                const inputs = document.querySelectorAll('input');
+                if (inputs.length > 0) {
+                    inputs[0].click();
+                    inputs[0].focus();
+                }
+            });
+        } catch (focusErr) {
+            if (!isNavigationError(focusErr)) throw focusErr;
+        }
 
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // 使用 type 方法模拟真实键盘输入
-        await page.type('input', email, { delay: 30 });
-        if (!quietMode) console.log(`[线程 ${threadId}] 已填写邮箱:`, email);
+        // 使用安全输入方法（带重试）
+        const emailTyped = await safeTypeInput(page, 'input', email, { delay: 30 });
+        if (emailTyped) {
+            if (!quietMode) console.log(`[线程 ${threadId}] 已填写邮箱:`, email);
+        } else {
+            if (!quietMode) console.log(`[线程 ${threadId}] 邮箱输入时页面可能已导航`);
+        }
 
         // 等待一下
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -366,57 +420,84 @@ async function runTask(threadId, config) {
 
         await new Promise(resolve => setTimeout(resolve, 1000));
 
-        // 查找并点击按钮 (带重试)
+        // 查找并点击按钮 (带重试和点击验证)
         let emailSubmitted = false;
-        for (let i = 0; i < 5; i++) {
-            const clicked = await page.evaluate(() => {
-                const targets = ['继续', 'Next', '邮箱', 'Next', 'Continue'];
-                const elements = [
-                    ...document.querySelectorAll('button'),
-                    ...document.querySelectorAll('input[type="submit"]'),
-                    ...document.querySelectorAll('div[role="button"]'),
-                    ...document.querySelectorAll('span[role="button"]')
-                ];
+        for (let i = 0; i < 8; i++) {
+            try {
+                const clicked = await page.evaluate(() => {
+                    if (!document.body) return { clicked: false, reason: 'body_null' };
+                    
+                    const targets = ['继续', 'Next', '邮箱', 'Next', 'Continue'];
+                    const elements = [
+                        ...document.querySelectorAll('button'),
+                        ...document.querySelectorAll('input[type="submit"]'),
+                        ...document.querySelectorAll('div[role="button"]'),
+                        ...document.querySelectorAll('span[role="button"]')
+                    ];
 
-                for (const element of elements) {
-                    // 检查可见性
-                    const style = window.getComputedStyle(element);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-                    if (element.disabled) continue;
+                    for (const element of elements) {
+                        if (!element) continue;
+                        // 检查可见性
+                        const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                        if (element.disabled) continue;
 
-                    const text = element.textContent.trim();
-                    if (targets.some(t => text.includes(t))) {
-                        element.click();
-                        return true;
+                        const text = element.textContent ? element.textContent.trim() : '';
+                        if (targets.some(t => text.includes(t))) {
+                            element.click();
+                            return { clicked: true, text: text };
+                        }
                     }
+
+                    // 备用：查找主要按钮
+                    const primaryBtn = document.querySelector('button[color="primary"], button.primary');
+                    if (primaryBtn && !primaryBtn.disabled) {
+                        primaryBtn.click();
+                        return { clicked: true, text: 'primary' };
+                    }
+
+                    return { clicked: false, reason: 'no_button' };
+                });
+
+                if (clicked.clicked) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] ✓ 点击按钮成功: ${clicked.text}`);
+                    // 等待并验证点击是否生效（页面变化）
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                    const pageChanged = await page.evaluate(() => {
+                        if (!document.body) return true; // 页面正在导航
+                        // 检查是否有加载指示器或页面内容变化
+                        const loading = document.querySelector('[class*="loading"], [class*="spinner"], [class*="progress"]');
+                        return !!loading;
+                    }).catch(() => true); // 如果执行失败，认为页面正在变化
+                    
+                    emailSubmitted = true;
+                    break;
+                } else {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/8: ${clicked.reason}, 等待重试...`);
                 }
-
-                // 备用：查找主要按钮
-                const primaryBtn = document.querySelector('button[color="primary"], button.primary');
-                if (primaryBtn && !primaryBtn.disabled) {
-                    primaryBtn.click();
-                    return true;
-                }
-
-                return false;
-            });
-
-            if (clicked) {
-                emailSubmitted = true;
-                break;
+            } catch (err) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/8: 点击出错 ${err.message}, 重试...`);
             }
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, 1500));
         }
 
         if (!emailSubmitted) {
             throw new Error('找不到提交按钮');
         }
         await new Promise(resolve => setTimeout(resolve, 5000));
-
-        // 检查邮箱提交结果：是否发送成功、是否有错误
-        const emailSubmitResult = await page.evaluate(() => {
-            const pageText = document.body.textContent;
-            const pageHtml = document.body.innerHTML.toLowerCase();
+        let emailSubmitResult = null;
+        let navigationDetected = false;
+        for (let checkAttempt = 0; checkAttempt < 5; checkAttempt++) {
+            try {
+                // 等待页面稳定
+                await page.waitForFunction(() => document.readyState === 'complete', { timeout: 5000 }).catch(() => {});
+                
+                emailSubmitResult = await page.evaluate(() => {
+                    if (!document.body) {
+                        return { success: false, error: '页面未加载', needRetry: true };
+                    }
+                    const pageText = document.body.textContent || '';
+                    const pageHtml = (document.body.innerHTML || '').toLowerCase();
             
             // 检查常见错误信息
             const errorPatterns = [
@@ -447,7 +528,8 @@ async function runTask(threadId, config) {
             // 检查是否有错误提示元素（红色文字、错误图标等）
             const errorElements = document.querySelectorAll('[class*="error"], [class*="Error"], [role="alert"], .error-message');
             for (const el of errorElements) {
-                const text = el.textContent.trim();
+                if (!el) continue;
+                const text = (el.textContent || '').trim();
                 if (text && text.length > 0 && text.length < 200) {
                     return { success: false, error: `页面错误: ${text}`, needsVerification: false };
                 }
@@ -466,8 +548,46 @@ async function runTask(threadId, config) {
             }
             
             // 默认认为成功，需要验证
-            return { success: true, error: null, needsVerification: true };
+            return { success: true, error: null, needsVerification: true, needRetry: false };
         });
+                
+                // 如果需要重试（页面未加载）
+                if (emailSubmitResult && emailSubmitResult.needRetry) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 页面未加载完成，重试检查 ${checkAttempt + 1}/5...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    continue;
+                }
+                break;
+            } catch (err) {
+                // 页面导航错误通常表示操作成功
+                if (isNavigationError(err)) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] ✓ 检测到页面导航，等待页面加载...`);
+                    navigationDetected = true;
+                    // 等待页面稳定
+                    await new Promise(resolve => setTimeout(resolve, 3000));
+                    try {
+                        await page.waitForFunction(() => document.readyState === 'complete', { timeout: 10000 });
+                    } catch (e) {
+                        // 忽略超时
+                    }
+                    continue;
+                }
+                if (!quietMode) console.log(`[线程 ${threadId}] 检查提交结果出错: ${err.message}, 重试 ${checkAttempt + 1}/5...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+        }
+        
+        // 如果检测到导航但没有结果，认为成功
+        if (!emailSubmitResult && navigationDetected) {
+            emailSubmitResult = { success: true, error: null, needsVerification: true };
+            if (!quietMode) console.log(`[线程 ${threadId}] ✓ 页面已导航，认为提交成功`);
+        }
+        
+        // 如果所有尝试都失败，设置默认结果
+        if (!emailSubmitResult) {
+            emailSubmitResult = { success: true, error: null, needsVerification: true };
+            if (!quietMode) console.log(`[线程 ${threadId}] ⚠️ 无法确认提交结果，假设成功继续`);
+        }
 
         // 处理邮箱提交结果
         if (!emailSubmitResult.success) {
@@ -543,11 +663,12 @@ async function runTask(threadId, config) {
                         ];
                         
                         for (const element of elements) {
-                            const text = element.textContent.trim();
+                            if (!element) continue;
+                            const text = element.textContent ? element.textContent.trim() : '';
                             const style = window.getComputedStyle(element);
                             if (style.display === 'none' || style.visibility === 'hidden') continue;
                             
-                            if (resendTexts.some(t => text.toLowerCase().includes(t.toLowerCase()))) {
+                            if (text && resendTexts.some(t => text.toLowerCase().includes(t.toLowerCase()))) {
                                 element.click();
                                 return true;
                             }
@@ -578,67 +699,105 @@ async function runTask(threadId, config) {
 
 
             // 等待验证码输入框并确保页面稳定
-            await page.waitForSelector('input', { timeout: 30000 });
+            try {
+                await page.waitForSelector('input', { timeout: 30000 });
+            } catch (waitErr) {
+                if (isNavigationError(waitErr)) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 等待验证码输入框时页面导航，重试...`);
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    await page.waitForSelector('input', { timeout: 30000 }).catch(() => {});
+                } else {
+                    throw waitErr;
+                }
+            }
             await new Promise(resolve => setTimeout(resolve, 2000));
 
             // 清空可能的旧值并聚焦
-            await page.evaluate(() => {
-                const inputs = document.querySelectorAll('input');
-                if (inputs.length > 0) {
-                    inputs[0].value = '';
-                    inputs[0].click();
-                    inputs[0].focus();
-                }
-            });
+            try {
+                await page.evaluate(() => {
+                    const inputs = document.querySelectorAll('input');
+                    if (inputs.length > 0) {
+                        inputs[0].value = '';
+                        inputs[0].click();
+                        inputs[0].focus();
+                    }
+                });
+            } catch (focusErr) {
+                if (!isNavigationError(focusErr)) throw focusErr;
+            }
 
             await new Promise(resolve => setTimeout(resolve, 500));
 
-            // 使用 type 方法输入验证码
-            await page.type('input', verificationCode, { delay: 30 });
-            if (!quietMode) console.log(`[线程 ${threadId}] 已填写验证码`);
+            // 使用安全输入方法输入验证码
+            const codeTyped = await safeTypeInput(page, 'input', verificationCode, { delay: 30 });
+            if (codeTyped) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 已填写验证码`);
+            } else {
+                if (!quietMode) console.log(`[线程 ${threadId}] 验证码输入时页面可能已导航`);
+            }
 
             await new Promise(resolve => setTimeout(resolve, 2000));
 
             // 触发 blur
-            await page.evaluate(() => {
-                const inputs = document.querySelectorAll('input');
-                if (inputs.length > 0) {
-                    inputs[0].blur();
-                }
-            });
+            try {
+                await page.evaluate(() => {
+                    const inputs = document.querySelectorAll('input');
+                    if (inputs.length > 0) {
+                        inputs[0].blur();
+                    }
+                });
+            } catch (blurErr) {
+                // 忽略导航错误
+            }
 
             await new Promise(resolve => setTimeout(resolve, 1000));
             let verifySubmitted = false;
+            let verifyNavigation = false;
             for (let i = 0; i < 5; i++) {
-                const verifyClicked = await page.evaluate(() => {
-                    const targets = ['验证', 'Verify', '继续', 'Next', 'Continue'];
-                    const elements = [
-                        ...document.querySelectorAll('button'),
-                        ...document.querySelectorAll('input[type="submit"]'),
-                        ...document.querySelectorAll('div[role="button"]')
-                    ];
+                try {
+                    const verifyClicked = await page.evaluate(() => {
+                        const targets = ['验证', 'Verify', '继续', 'Next', 'Continue'];
+                        const elements = [
+                            ...document.querySelectorAll('button'),
+                            ...document.querySelectorAll('input[type="submit"]'),
+                            ...document.querySelectorAll('div[role="button"]')
+                        ];
 
-                    for (const element of elements) {
-                        const style = window.getComputedStyle(element);
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-                        if (element.disabled) continue;
+                        for (const element of elements) {
+                            if (!element) continue;
+                            const style = window.getComputedStyle(element);
+                            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                            if (element.disabled) continue;
 
-                        const text = element.textContent.trim();
-                        if (targets.some(t => text.includes(t))) {
-                            element.click();
-                            return true;
+                            const text = element.textContent ? element.textContent.trim() : '';
+                            if (targets.some(t => text.includes(t))) {
+                                element.click();
+                                return true;
+                            }
                         }
-                    }
-                    return false;
-                });
+                        return false;
+                    });
 
-                if (verifyClicked) {
-                    verifySubmitted = true;
-                    break;
-                } else {
-                    if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到验证提交按钮，等待重试...`);
+                    if (verifyClicked) {
+                        verifySubmitted = true;
+                        break;
+                    } else {
+                        if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到验证提交按钮，等待重试...`);
+                    }
+                } catch (clickErr) {
+                    if (isNavigationError(clickErr)) {
+                        if (!quietMode) console.log(`[线程 ${threadId}] 点击验证按钮后页面已导航`);
+                        verifyNavigation = true;
+                        verifySubmitted = true;
+                        break;
+                    }
                 }
                 await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+            
+            // 如果检测到导航，认为验证成功
+            if (verifyNavigation) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 验证码验证成功（页面已导航）`);
             }
 
             // 等待重定向
@@ -649,7 +808,8 @@ async function runTask(threadId, config) {
             let verifyResult = { success: true, error: null };
             try {
                 verifyResult = await page.evaluate(() => {
-                    const pageText = document.body.textContent;
+                    if (!document.body) return { success: true, error: null }; // 页面正在导航
+                    const pageText = document.body.textContent || '';
                     
                     // 检查验证码错误
                     const errorPatterns = [
@@ -687,8 +847,7 @@ async function runTask(threadId, config) {
                 });
             } catch (err) {
                 // 页面导航导致上下文销毁，说明验证成功并跳转了
-                if (err.message.includes('Execution context was destroyed') || 
-                    err.message.includes('navigation')) {
+                if (isNavigationError(err)) {
                     if (!quietMode) console.log(`[线程 ${threadId}] ✓ 页面已跳转，验证码验证成功`);
                     verifyResult = { success: true, error: null };
                 } else {
@@ -711,81 +870,112 @@ async function runTask(threadId, config) {
         if (!quietMode) console.log(`[线程 ${threadId}] 生成的全名:`, fullName);
 
         // 等待输入框并确保页面稳定
-        await page.waitForSelector('input', { timeout: 30000 });
+        try {
+            await page.waitForSelector('input', { timeout: 30000 });
+        } catch (waitErr) {
+            if (isNavigationError(waitErr)) {
+                if (!quietMode) console.log(`[线程 ${threadId}] 等待输入框时页面导航`);
+            }
+        }
         await new Promise(resolve => setTimeout(resolve, 2000));
 
         // 清空可能的旧值并聚焦
-        await page.evaluate(() => {
-            const inputs = document.querySelectorAll('input');
-            if (inputs.length > 0) {
-                inputs[0].value = '';
-                inputs[0].click();
-                inputs[0].focus();
-            }
-        });
+        try {
+            await page.evaluate(() => {
+                const inputs = document.querySelectorAll('input');
+                if (inputs.length > 0) {
+                    inputs[0].value = '';
+                    inputs[0].click();
+                    inputs[0].focus();
+                }
+            });
+        } catch (focusErr) {
+            // 忽略导航错误
+        }
 
         await new Promise(resolve => setTimeout(resolve, 500));
 
-        // 使用 type 方法输入全名
-        await page.type('input', fullName, { delay: 30 });
-        if (!quietMode) console.log(`[线程 ${threadId}] 已填写全名`);
+        // 使用安全输入方法输入全名
+        const nameTyped = await safeTypeInput(page, 'input', fullName, { delay: 30 });
+        if (nameTyped) {
+            if (!quietMode) console.log(`[线程 ${threadId}] 已填写全名`);
+        } else {
+            if (!quietMode) console.log(`[线程 ${threadId}] 全名输入时页面可能已导航`);
+        }
 
         await new Promise(resolve => setTimeout(resolve, 2000));
 
         // 触发 blur
-        await page.evaluate(() => {
-            const inputs = document.querySelectorAll('input');
-            if (inputs.length > 0) {
-                inputs[0].blur();
-            }
-        });
+        try {
+            await page.evaluate(() => {
+                const inputs = document.querySelectorAll('input');
+                if (inputs.length > 0) {
+                    inputs[0].blur();
+                }
+            });
+        } catch (blurErr) {
+            // 忽略导航错误
+        }
 
         await new Promise(resolve => setTimeout(resolve, 1000));
 
         // 确认提交 (带重试)
         if (!quietMode) console.log(`[线程 ${threadId}] 准备提交全名...`);
         let confirmSubmitted = false;
+        let confirmNavigation = false;
         for (let i = 0; i < 5; i++) {
-            const confirmClicked = await page.evaluate(() => {
-                const targets = ['同意', 'Confirm', '继续', 'Next', 'Continue'];
-                const elements = [
-                    ...document.querySelectorAll('button'),
-                    ...document.querySelectorAll('input[type="submit"]'),
-                    ...document.querySelectorAll('div[role="button"]')
-                ];
+            try {
+                const confirmClicked = await page.evaluate(() => {
+                    const targets = ['同意', 'Confirm', '继续', 'Next', 'Continue'];
+                    const elements = [
+                        ...document.querySelectorAll('button'),
+                        ...document.querySelectorAll('input[type="submit"]'),
+                        ...document.querySelectorAll('div[role="button"]')
+                    ];
 
-                for (const element of elements) {
-                    const style = window.getComputedStyle(element);
-                    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
-                    if (element.disabled) continue;
+                    for (const element of elements) {
+                        if (!element) continue;
+                        const style = window.getComputedStyle(element);
+                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+                        if (element.disabled) continue;
 
-                    const text = element.textContent.trim();
-                    if (targets.some(t => text.includes(t))) {
-                        element.click();
-                        return true;
+                        const text = element.textContent ? element.textContent.trim() : '';
+                        if (targets.some(t => text.includes(t))) {
+                            element.click();
+                            return true;
+                        }
                     }
-                }
 
-                // 备用: 点击第一个可见的按钮
-                for (const element of elements) {
-                    if (element.offsetParent !== null && !element.disabled) {
-                        element.click();
-                        return true;
+                    // 备用: 点击第一个可见的按钮
+                    for (const element of elements) {
+                        if (element && element.offsetParent !== null && !element.disabled) {
+                            element.click();
+                            return true;
+                        }
                     }
-                }
-                return false;
-            });
+                    return false;
+                });
 
-            if (confirmClicked) {
-                confirmSubmitted = true;
-                break;
-            } else {
-                if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到确认按钮，等待重试...`);
+                if (confirmClicked) {
+                    confirmSubmitted = true;
+                    break;
+                } else {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 尝试 ${i + 1}/5: 未找到确认按钮，等待重试...`);
+                }
+            } catch (confirmErr) {
+                if (isNavigationError(confirmErr)) {
+                    if (!quietMode) console.log(`[线程 ${threadId}] 点击确认按钮后页面已导航`);
+                    confirmNavigation = true;
+                    confirmSubmitted = true;
+                    break;
+                }
             }
             await new Promise(resolve => setTimeout(resolve, 1500));
         }
 
-        if (!confirmSubmitted) {
+        // 如果检测到导航，认为提交成功
+        if (confirmNavigation) {
+            if (!quietMode) console.log(`[线程 ${threadId}] 确认提交成功（页面已导航）`);
         }
         // 循环检查 authorization，如果没获取到就继续尝试点击按钮
         await new Promise(resolve => setTimeout(resolve, 2000));
@@ -797,9 +987,11 @@ async function runTask(threadId, config) {
             let clickedNext = false;
             try {
                 clickedNext = await page.evaluate(() => {
+                    if (!document.body) return false;
                     const buttons = document.querySelectorAll('button');
                     for (const button of buttons) {
-                        const text = button.textContent;
+                        if (!button) continue;
+                        const text = button.textContent || '';
                         if (text.includes('同意') || text.includes('Confirm') || text.includes('继续') || text.includes('Next') || text.includes('I agree')) {
                             if (button.offsetParent !== null && !button.disabled) {
                                 button.click();
@@ -811,7 +1003,7 @@ async function runTask(threadId, config) {
                 });
             } catch (err) {
                 // 忽略页面导航导致的上下文销毁错误
-                if (!err.message.includes('Execution context was destroyed')) {
+                if (!isNavigationError(err)) {
                     console.error(`[线程 ${threadId}] 检查按钮时出错:`, err.message);
                 }
             }

@@ -187,7 +187,7 @@ type Account struct {
 	mu sync.Mutex
 }
 
-const refreshCooldown = 5 * time.Minute // 刷新冷却时间
+const refreshCooldown = 4 * time.Minute // 刷新冷却时间（需小于 JwtTTL）
 
 // ==================== 号池管理 ====================
 
@@ -298,6 +298,26 @@ func (p *AccountPool) MarkReady(acc *Account) {
 	acc.Refreshed = true
 	p.readyAccounts = append(p.readyAccounts, acc)
 }
+func (p *AccountPool) MarkPending(acc *Account) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, a := range p.readyAccounts {
+		if a == acc {
+			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
+			break
+		}
+	}
+
+	// 标记需要刷新，保留 JWT（刷新时会覆盖）
+	acc.mu.Lock()
+	acc.Refreshed = false
+	acc.mu.Unlock()
+
+	// 加入 pending 池
+	p.pendingAccounts = append(p.pendingAccounts, acc)
+	log.Printf("🔄 账号 %s 移至刷新池", filepath.Base(acc.FilePath))
+}
+
 func (p *AccountPool) RemoveAccount(acc *Account) {
 	if err := os.Remove(acc.FilePath); err != nil {
 		log.Printf("⚠️ 删除文件失败 %s: %v", acc.FilePath, err)
@@ -360,7 +380,6 @@ func (p *AccountPool) refreshWorker(id int) {
 
 		acc.JWTExpires = time.Time{}
 		if err := acc.RefreshJWT(); err != nil {
-			// 只有账号失效（401/403）才删除，其他错误放回队列重试
 			if strings.Contains(err.Error(), "账号失效") {
 				log.Printf("❌ [worker-%d] [%s] %v", id, acc.Data.Email, err)
 				p.RemoveAccount(acc)
@@ -441,29 +460,6 @@ func (p *AccountPool) ReadyCount() int {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return len(p.readyAccounts)
-}
-
-func (p *AccountPool) MarkPending(acc *Account) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// 从 ready 池移除
-	for i, a := range p.readyAccounts {
-		if a == acc {
-			p.readyAccounts = append(p.readyAccounts[:i], p.readyAccounts[i+1:]...)
-			break
-		}
-	}
-
-	acc.Refreshed = false
-	p.pendingAccounts = append(p.pendingAccounts, acc)
-}
-func (acc *Account) InvalidateJWT() {
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
-	acc.JWT = ""
-	acc.JWTExpires = time.Time{}
-	acc.LastRefresh = time.Time{} // 清除冷却时间，允许立即刷新
 }
 
 func extractCSESIDX(auth string) string {
@@ -761,22 +757,18 @@ func (acc *Account) RefreshJWT() error {
 }
 
 func (acc *Account) GetJWT() (string, string, error) {
-	if err := acc.RefreshJWT(); err != nil {
-		return "", "", err
-	}
 	acc.mu.Lock()
 	defer acc.mu.Unlock()
+	if acc.JWT == "" {
+		return "", "", fmt.Errorf("JWT 为空，账号未刷新")
+	}
 	return acc.JWT, acc.ConfigID, nil
 }
-
-// 获取 configId - 优先从账号文件，其次从环境变量
 func (acc *Account) fetchConfigID() (string, error) {
 	// 1. 优先使用账号文件中的 configId
 	if acc.Data.ConfigID != "" {
 		return acc.Data.ConfigID, nil
 	}
-
-	// 2. 使用环境变量中的默认 configId
 	if DefaultConfig != "" {
 		return DefaultConfig, nil
 	}
@@ -1596,6 +1588,11 @@ func streamChat(c *gin.Context, req ChatRequest) {
 			resp.Body.Close()
 			log.Printf("❌ [%s] Google 报错: %d %s (重试 %d/%d)", acc.Data.Email, resp.StatusCode, string(body), retry+1, maxRetries)
 			lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+			// 401/403 无权限，移至刷新池
+			if resp.StatusCode == 401 || resp.StatusCode == 403 {
+				log.Printf("⚠️ [%s] %d 无权限，移至刷新池", acc.Data.Email, resp.StatusCode)
+				pool.MarkPending(acc)
+			}
 			// 429 限流，标记账号进入冷却，下次 Next() 会自动切换到其他账号
 			if resp.StatusCode == 429 {
 				acc.mu.Lock()
@@ -1612,8 +1609,7 @@ func streamChat(c *gin.Context, req ChatRequest) {
 
 		// 快速检查是否是认证错误响应
 		if bytes.Contains(respBody, []byte("uToken")) && !bytes.Contains(respBody, []byte("streamAssistResponse")) {
-			log.Printf("⚠️ [%s] 收到认证响应，标记账号需要刷新", acc.Data.Email)
-			acc.InvalidateJWT()
+			log.Printf("⚠️ [%s] 收到认证响应，移至刷新池", acc.Data.Email)
 			pool.MarkPending(acc)
 			lastErr = fmt.Errorf("认证失败，需要刷新账号")
 			continue
