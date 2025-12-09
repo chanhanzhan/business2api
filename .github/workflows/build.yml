@@ -53,6 +53,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           VERSION: ${{ steps.version.outputs.VERSION }}
+          GOTOOLCHAIN: auto
         run: |
           EXT=""
           if [ "$GOOS" = "windows" ]; then

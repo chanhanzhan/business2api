@@ -1,6 +1,6 @@
 module business2api
 
-go 1.23
+go 1.25
 
 require (
 	github.com/gin-gonic/gin v1.9.1
