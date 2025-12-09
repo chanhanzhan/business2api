@@ -99,6 +99,101 @@ var (
 	flowHandler      *flow.GenerationHandler
 )
 
+// APIStats API 调用统计
+type APIStats struct {
+	mu              sync.RWMutex
+	startTime       time.Time   // 服务启动时间
+	totalRequests   int64       // 总请求数
+	successRequests int64       // 成功请求数
+	failedRequests  int64       // 失败请求数
+	inputTokens     int64       // 输入 tokens
+	outputTokens    int64       // 输出 tokens
+	imageGenerated  int64       // 生成的图片数
+	videoGenerated  int64       // 生成的视频数
+	requestTimes    []time.Time // 最近请求时间（用于计算 RPM）
+}
+
+var apiStats = &APIStats{
+	startTime:    time.Now(),
+	requestTimes: make([]time.Time, 0, 1000),
+}
+
+// RecordRequest 记录请求
+func (s *APIStats) RecordRequest(success bool, inputTokens, outputTokens, images, videos int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.totalRequests++
+	if success {
+		s.successRequests++
+	} else {
+		s.failedRequests++
+	}
+	s.inputTokens += inputTokens
+	s.outputTokens += outputTokens
+	s.imageGenerated += images
+	s.videoGenerated += videos
+
+	// 记录请求时间（保留最近1000条）
+	now := time.Now()
+	s.requestTimes = append(s.requestTimes, now)
+	if len(s.requestTimes) > 1000 {
+		s.requestTimes = s.requestTimes[len(s.requestTimes)-1000:]
+	}
+}
+
+// GetRPM 计算最近一分钟的 RPM
+func (s *APIStats) GetRPM() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	oneMinuteAgo := time.Now().Add(-time.Minute)
+	count := 0
+	for i := len(s.requestTimes) - 1; i >= 0; i-- {
+		if s.requestTimes[i].After(oneMinuteAgo) {
+			count++
+		} else {
+			break
+		}
+	}
+	return float64(count)
+}
+
+// GetStats 获取统计数据
+func (s *APIStats) GetStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	uptime := time.Since(s.startTime)
+	avgRPM := float64(0)
+	if uptime.Minutes() > 0 {
+		avgRPM = float64(s.totalRequests) / uptime.Minutes()
+	}
+
+	return map[string]interface{}{
+		"uptime":           uptime.String(),
+		"uptime_seconds":   int64(uptime.Seconds()),
+		"total_requests":   s.totalRequests,
+		"success_requests": s.successRequests,
+		"failed_requests":  s.failedRequests,
+		"success_rate":     fmt.Sprintf("%.2f%%", float64(s.successRequests)/float64(max(s.totalRequests, 1))*100),
+		"input_tokens":     s.inputTokens,
+		"output_tokens":    s.outputTokens,
+		"total_tokens":     s.inputTokens + s.outputTokens,
+		"images_generated": s.imageGenerated,
+		"videos_generated": s.videoGenerated,
+		"current_rpm":      s.GetRPM(),
+		"average_rpm":      fmt.Sprintf("%.2f", avgRPM),
+	}
+}
+
+func max(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 var appConfig = AppConfig{
 	ListenAddr: ":8000",
 	DataDir:    "./data",
@@ -1533,6 +1628,17 @@ func streamChat(c *gin.Context, req ChatRequest) {
 	chatID := "chatcmpl-" + uuid.New().String()
 	createdTime := time.Now().Unix()
 	clientIP := c.ClientIP()
+
+	// 统计变量
+	var statsSuccess bool
+	var statsInputTokens int64
+	var statsOutputTokens int64
+	var statsImages int64
+	var statsVideos int64
+	defer func() {
+		apiStats.RecordRequest(statsSuccess, statsInputTokens, statsOutputTokens, statsImages, statsVideos)
+	}()
+
 	// 入站日志
 	log.Printf("📥 [%s] 请求: model=%s ", clientIP, req.Model)
 
@@ -2075,11 +2181,14 @@ func streamChat(c *gin.Context, req ChatRequest) {
 		if hasToolCalls {
 			finishReason = "tool_calls"
 		}
-		// 最终chunk必须包含非空delta，否则某些客户端会报"delta/message is null"
 		finalChunk := createChunk(chatID, createdTime, req.Model, nil, &finishReason)
 		fmt.Fprintf(writer, "data: %s\n\n", finalChunk)
 		fmt.Fprintf(writer, "data: [DONE]\n\n")
 		flusher.Flush()
+
+		// 更新统计
+		statsSuccess = true
+		statsImages = int64(len(pendingFiles))
 	} else {
 		// 非流式响应
 		var fullContent strings.Builder
@@ -2166,14 +2275,19 @@ func streamChat(c *gin.Context, req ChatRequest) {
 				"total_tokens":      0,
 			},
 		}
-
-		// 对于长时间运行的模型，停止心跳后直接写入 JSON
 		if isLongRunning && heartbeatDone != nil {
 			close(heartbeatDone) // 停止心跳
 			jsonBytes, _ := json.Marshal(response)
 			c.Writer.Write(jsonBytes)
 		} else {
 			c.JSON(200, response)
+		}
+
+		// 更新统计
+		statsSuccess = true
+		statsOutputTokens = int64(fullContent.Len() / 4) // 粗略估算输出 tokens
+		if hasFile {
+			statsImages = 1
 		}
 	}
 }
@@ -2468,22 +2582,31 @@ func setupAPIRoutes(r *gin.Engine) {
 	})
 
 	r.GET("/", func(c *gin.Context) {
+		stats := apiStats.GetStats()
 		c.JSON(200, gin.H{
 			"status":  "running",
 			"service": "business2api",
 			"version": "2.1.6",
-			"endpoints": gin.H{
-				"openai": "/v1/chat/completions",
-				"claude": "/v1/messages",
-				"gemini": "/v1beta/models/{model}:generateContent",
-				"models": "/v1/models",
-				"health": "/health",
-			},
+			// 统计数据
+			"uptime":           stats["uptime"],
+			"total_requests":   stats["total_requests"],
+			"success_requests": stats["success_requests"],
+			"failed_requests":  stats["failed_requests"],
+			"success_rate":     stats["success_rate"],
+			"input_tokens":     stats["input_tokens"],
+			"output_tokens":    stats["output_tokens"],
+			"total_tokens":     stats["total_tokens"],
+			"images_generated": stats["images_generated"],
+			"videos_generated": stats["videos_generated"],
+			"current_rpm":      stats["current_rpm"],
+			"average_rpm":      stats["average_rpm"],
 			"pool": gin.H{
 				"ready":   pool.Pool.ReadyCount(),
 				"pending": pool.Pool.PendingCount(),
 				"total":   pool.Pool.TotalCount(),
 			},
+			// Flow 状态
+			"flow_enabled": flowHandler != nil,
 		})
 	})
 

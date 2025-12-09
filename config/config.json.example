@@ -4,7 +4,6 @@
   "data_dir": "./data",
   "default_config": "",
   "debug": false,
-  
   "pool": {
     "target_count": 50,
     "min_count": 10,
@@ -19,7 +18,6 @@
     "browser_refresh_headless": false,
     "browser_refresh_max_retry": 1
   },
-  
   "pool_server": {
     "enable": false,
     "mode": "local",
@@ -28,20 +26,15 @@
     "target_count": 50,
     "data_dir": "./data"
   },
-  
   "proxy_pool": {
     "proxy": "",
     "subscribes": [
       "https://example.com/subscribe/base64"
     ],
-    "files": [
-      "./proxies.txt"
-    ],
-    "xray_path": "/usr/local/bin/xray",
+    "files": [],
     "health_check": true,
-    "check_on_startup": false
+    "check_on_startup": true
   },
-  
   "flow": {
     "enable": false,
     "tokens": [],
