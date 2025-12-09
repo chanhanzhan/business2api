@@ -1192,27 +1192,33 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 		maxWaitTime := 3 * time.Minute
 		startTime := time.Now()
 		clickCount := 0
+		resendAttempted := false // 是否已尝试重发
 
 		for time.Since(startTime) < maxWaitTime {
-			// 首先检查页面是否有错误（验证码发送失败等）
-			errorCheck, _ := page.Eval(`() => {
+			// 检查页面状态
+			pageStatus, _ := page.Eval(`() => {
 				const pageText = document.body ? document.body.innerText : '';
 				
+				// 检查是否在验证码页面（正常状态）
+				const isCodePage = pageText.includes('6-character code') || 
+					pageText.includes('verification code') ||
+					pageText.includes('Enter verification') ||
+					pageText.includes('验证码') ||
+					pageText.includes('We sent');
+				
 				// 检查底部 toast/snackbar 错误提示
-				// "Something went wrong. Please try again later or choose another login method."
 				const toastSelectors = [
 					'[role="alert"]',
 					'.snackbar', '.toast', '.notification',
-					'aside', // Google 风格的错误提示
-					'[class*="error"]', '[class*="alert"]',
-					'[jscontroller="Q9PAie"]' // Google 特定的错误容器
+					'aside',
+					'[jscontroller="Q9PAie"]'
 				];
 				let toastError = null;
 				for (const sel of toastSelectors) {
 					const el = document.querySelector(sel);
 					if (el && el.offsetParent !== null) {
 						const text = el.textContent || '';
-						if (text.includes('went wrong') || text.includes('try again') || 
+						if (text.includes('went wrong') || text.includes('try again later') || 
 							text.includes('出了点问题') || text.includes('稍后再试') ||
 							text.includes('choose another') || text.includes('login method')) {
 							toastError = text;
@@ -1221,34 +1227,41 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 					}
 				}
 				
-				// 检查各种错误情况
+				// 严格的错误检测（排除正常验证码页面的提示）
 				const errorIndicators = [
-					'出了点问题', 'Something went wrong', 'went wrong',
-					'稍后再试', 'try again later',
+					'出了点问题', 'Something went wrong',
 					'无法发送', 'cannot send', 'failed to send',
-					'choose another login method', 'login method',
+					'choose another login method',
 					'too many', '请求过多'
 				];
-				const hasTextError = errorIndicators.some(ind => pageText.toLowerCase().includes(ind.toLowerCase()));
+				const hasTextError = !isCodePage && errorIndicators.some(ind => 
+					pageText.toLowerCase().includes(ind.toLowerCase()));
 				
-				// 检查是否有 Try again 按钮（表示错误状态）
+				// 检查是否有 Try again 按钮（表示错误状态，但不是在验证码页面）
 				const tryAgainBtn = document.querySelector('.mdc-button__label');
-				const hasTryAgain = tryAgainBtn && (tryAgainBtn.textContent.includes('Try again') || 
-					tryAgainBtn.textContent.includes('重试'));
+				const hasTryAgain = tryAgainBtn && !isCodePage && 
+					(tryAgainBtn.textContent.includes('Try again') || tryAgainBtn.textContent.includes('重试'));
 				
-				const hasError = toastError || hasTextError || hasTryAgain;
+				// 查找重发按钮
+				const resendBtn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
+					document.querySelector('span.YuMlnb-vQzf8d') ||
+					Array.from(document.querySelectorAll('span, button, a')).find(el => 
+						el.textContent && (el.textContent.includes('重新发送') || 
+						el.textContent.includes('Resend') || el.textContent.includes('resend')));
 				
 				return { 
-					hasError: hasError,
+					isCodePage: isCodePage,
+					hasError: toastError || hasTextError || hasTryAgain,
 					hasTryAgain: hasTryAgain,
+					hasResendBtn: !!resendBtn,
 					toastError: toastError || '',
 					errorText: toastError || pageText.substring(0, 150)
 				};
 			}`)
 
-			if errorCheck != nil && errorCheck.Value.Get("hasError").Bool() {
-				// 如果有 Try again 按钮，点击它
-				if errorCheck.Value.Get("hasTryAgain").Bool() {
+			// 处理错误状态
+			if pageStatus != nil && pageStatus.Value.Get("hasError").Bool() {
+				if pageStatus.Value.Get("hasTryAgain").Bool() {
 					log.Printf("[注册 %d] 检测到错误页面，尝试点击 Try again", threadID)
 					page.Eval(`() => {
 						const label = document.querySelector('.mdc-button__label');
@@ -1260,15 +1273,41 @@ func RunBrowserRegister(headless bool, proxy string, threadID int) (result *Brow
 					time.Sleep(3 * time.Second)
 					continue
 				}
-				// 其他错误直接返回
-				result.Error = fmt.Errorf("验证码发送失败: %s", errorCheck.Value.Get("errorText").String()[:50])
+				// 其他严重错误直接返回
+				errText := pageStatus.Value.Get("errorText").String()
+				if len(errText) > 50 {
+					errText = errText[:50]
+				}
+				result.Error = fmt.Errorf("验证码发送失败: %s", errText)
 				log.Printf("[注册 %d] ❌ %v", threadID, result.Error)
 				return result
 			}
 
-			// 尝试点击重发按钮
+			// 如果在验证码页面且还没尝试重发，先点击重发
+			if pageStatus != nil && pageStatus.Value.Get("isCodePage").Bool() && !resendAttempted {
+				if pageStatus.Value.Get("hasResendBtn").Bool() {
+					log.Printf("[注册 %d] 首次进入验证码页面，尝试点击重发按钮", threadID)
+					page.Eval(`() => {
+						const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
+							document.querySelector('span.YuMlnb-vQzf8d') ||
+							Array.from(document.querySelectorAll('span, button, a')).find(el => 
+								el.textContent && (el.textContent.includes('重新发送') || 
+								el.textContent.includes('Resend') || el.textContent.includes('resend')));
+						if (btn) {
+							btn.click();
+							if (btn.parentElement) btn.parentElement.click();
+						}
+					}`)
+					clickCount++
+					resendAttempted = true
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				resendAttempted = true // 没有重发按钮也标记为已尝试
+			}
+
+			// 尝试点击重发按钮（常规重发）
 			clickResult, _ := page.Eval(`() => {
-				// 精确匹配: <span jsname="V67aGc" class="YuMlnb-vQzf8d">重新发送验证码</span>
 				const btn = document.querySelector('span[jsname="V67aGc"].YuMlnb-vQzf8d') ||
 				            document.querySelector('span.YuMlnb-vQzf8d');
 				
