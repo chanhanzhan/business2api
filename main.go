@@ -717,6 +717,19 @@ func mergeConfig(base, loaded *AppConfig) {
 	// Flow 配置
 	base.Flow = loaded.Flow
 
+	// ProxyPool 配置
+	if len(loaded.ProxyPool.Subscribes) > 0 {
+		base.ProxyPool.Subscribes = loaded.ProxyPool.Subscribes
+	}
+	if len(loaded.ProxyPool.Files) > 0 {
+		base.ProxyPool.Files = loaded.ProxyPool.Files
+	}
+	if loaded.ProxyPool.Proxy != "" {
+		base.ProxyPool.Proxy = loaded.ProxyPool.Proxy
+	}
+	base.ProxyPool.HealthCheck = loaded.ProxyPool.HealthCheck
+	base.ProxyPool.CheckOnStartup = loaded.ProxyPool.CheckOnStartup
+
 	// Note
 	if len(loaded.Note) > 0 {
 		base.Note = loaded.Note
